@@ -1,0 +1,48 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environment
+.venv/
+venv/
+
+# Test and lint cache
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Models and indexes
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.faiss
+*.index
+
+# Generated data
+data/raw/*
+data/processed/*
+data/indexes/*
+
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/indexes/.gitkeep
+
+# System files
+.DS_Store
+Thumbs.db
