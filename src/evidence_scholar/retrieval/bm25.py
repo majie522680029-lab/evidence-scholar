@@ -15,11 +15,16 @@
 
 from __future__ import annotations
 
+import pickle
 import re
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from math import log1p
+from pathlib import Path
+
+from evidence_scholar.retrieval.base import BaseRetriever
+from evidence_scholar.retrieval.schemas import Document, RetrievalResult
 
 # 英文 token 正则：
 # - 匹配连续的英文字符和数字；
@@ -107,7 +112,7 @@ class BM25SearchResult:
     rank: int
 
 
-class BM25Index:
+class BM25Index(BaseRetriever):
     """BM25 index over a fixed, in-memory document collection.
 
     BM25 的核心思想：
@@ -116,8 +121,14 @@ class BM25Index:
     - 如果 query term 在整个语料中越少见，它越有区分度，IDF 越高；
     - 长文档天然包含更多词，因此需要做长度归一化，避免长文档占便宜。
 
-    这个类只接收已经分好词的文档，避免把数据清洗、Document 结构转换和索引
-    逻辑耦合在一起。上游应该先调用 build_document_tokens，再传入这里。
+    本类继承 BaseRetriever，提供两条初始化路径：
+    1. build_index(documents)：BaseRetriever 契约入口，接收 Document 对象，
+       内部自动分词。推荐用于与 Dense/Hybrid 统一调用的场景。
+    2. __init__(document_ids, tokenized_documents, ...)：接收已分词文档，
+       适合需要自定义分词逻辑或单元测试快速构造的场景。
+
+    两条路径都会缓存 titles/texts（若提供），使 search 能返回带 title/text
+    的 RetrievalResult，与 DenseRetriever 的返回结构一致。
     """
 
     def __init__(
@@ -127,8 +138,10 @@ class BM25Index:
         *,
         k1: float = 1.5,
         b: float = 0.75,
+        titles: Sequence[str] | None = None,
+        texts: Sequence[str] | None = None,
     ) -> None:
-        """Initialize a BM25 index.
+        """Initialize a BM25 index from pre-tokenized documents.
 
         Args:
             document_ids:
@@ -141,7 +154,32 @@ class BM25Index:
             b:
                 Controls document-length normalization.
                 b=0 表示不做长度归一化；b=1 表示完全按文档长度归一化。
+            titles:
+                与 document_ids 等长的标题序列，可选。提供后 search 返回的
+                RetrievalResult 会带 title，便于上层直接写 rankings 而无需回查 corpus。
+            texts:
+                与 document_ids 等长的正文序列，可选。作用同 titles。
         """
+        # 参数校验和索引进构逻辑统一委托给 _build_internal，
+        # build_index 也会复用它，避免两处重复实现。
+        self.k1 = k1
+        self.b = b
+        self._build_internal(
+            document_ids=document_ids,
+            tokenized_documents=tokenized_documents,
+            titles=titles,
+            texts=texts,
+        )
+
+    def _build_internal(
+        self,
+        *,
+        document_ids: Sequence[str],
+        tokenized_documents: Sequence[Sequence[str]],
+        titles: Sequence[str] | None,
+        texts: Sequence[str] | None,
+    ) -> None:
+        """Shared index construction logic for __init__ and build_index."""
         # 以下校验尽量在初始化阶段暴露数据问题：
         # - 空语料无法建立 BM25；
         # - document_id 和 tokenized document 必须一一对应；
@@ -158,16 +196,28 @@ class BM25Index:
         if len(set(document_ids)) != len(document_ids):
             raise ValueError("document_ids must be unique.")
 
-        if k1 <= 0:
+        if self.k1 <= 0:
             raise ValueError("k1 must be greater than zero.")
 
-        if not 0 <= b <= 1:
+        if not 0 <= self.b <= 1:
             raise ValueError("b must be between zero and one.")
 
         self.document_ids = list(document_ids)
-        self.k1 = k1
-        self.b = b
         self.document_count = len(self.document_ids)
+
+        # titles/texts 可选：未提供时用占位值，使 RetrievalResult 仍可构造。
+        # RetrievalResult.title 有 min_length=1 约束，故占位不能用空串；
+        # 这里用 document_id 作为 title 占位（document_id 必非空），可追溯。
+        # build_index 路径会传入真实 title/text；__init__ 路径按需传入。
+        if titles is not None:
+            self.titles = list(titles)
+        else:
+            self.titles = list(self.document_ids)
+
+        if texts is not None:
+            self.texts = list(texts)
+        else:
+            self.texts = list(self.document_ids)
 
         # 每篇文档内部的词频统计：
         # term_frequencies[i][term] 表示第 i 篇文档中 term 出现了多少次。
@@ -301,9 +351,8 @@ class BM25Index:
     def search(
         self,
         query: str,
-        *,
         top_k: int = 10,
-    ) -> list[BM25SearchResult]:
+    ) -> list[RetrievalResult]:
         """Rank indexed documents for a raw-text query.
 
         Args:
@@ -312,7 +361,7 @@ class BM25Index:
 
         Returns:
             按 BM25 分数从高到低排序的检索结果。每条结果包含 document_id、
-            score 和 rank。
+            title、text、score 和 rank，与 DenseRetriever 的返回结构一致。
 
         Raises:
             ValueError: top_k 小于等于 0 时抛出。
@@ -339,9 +388,12 @@ class BM25Index:
         result_count = min(top_k, self.document_count)
 
         # rank 从 1 开始，符合信息检索评测中 Recall@K / MRR@K 的常见约定。
+        # 返回带 title/text 的 RetrievalResult，对齐 BaseRetriever 契约与 DenseRetriever。
         return [
-            BM25SearchResult(
+            RetrievalResult(
                 document_id=self.document_ids[index],
+                title=self.titles[index],
+                text=self.texts[index],
                 score=scores[index],
                 rank=rank,
             )
@@ -350,3 +402,91 @@ class BM25Index:
                 start=1,
             )
         ]
+
+    def build_index(self, documents: Sequence[Document]) -> None:
+        """Build a BM25 index from Document objects (BaseRetriever contract).
+
+        与 DenseRetriever.build_index 对齐：接收未分词的 Document 列表，
+        内部用 build_document_tokens 完成分词和标题加权，再委托给
+        _build_internal 构造索引。建完后 titles/texts 已缓存，search 可直接
+        返回完整 RetrievalResult，上层无需回查 corpus。
+
+        Args:
+            documents: 待检索的文档序列，每个含 document_id/title/text。
+
+        Raises:
+            ValueError: 文档为空时抛出。
+        """
+        if not documents:
+            raise ValueError("Cannot build index from empty document set.")
+
+        document_ids = [doc.document_id for doc in documents]
+        tokenized_documents = [
+            build_document_tokens(
+                title=doc.title,
+                text=doc.text,
+            )
+            for doc in documents
+        ]
+        titles = [doc.title for doc in documents]
+        texts = [doc.text for doc in documents]
+
+        self._build_internal(
+            document_ids=document_ids,
+            tokenized_documents=tokenized_documents,
+            titles=titles,
+            texts=texts,
+        )
+
+    def save(self, path: Path) -> None:
+        """Persist the BM25 index state to a single pickle file.
+
+        BM25 的索引是纯 Python 数据结构（Counter / list），不像 Dense 需要
+        FAISS 二进制格式，因此用 pickle 整体序列化最简单。
+
+        Args:
+            path: 索引保存路径，父目录需存在或可创建。
+
+        Raises:
+            ValueError: 索引未建立（document_ids 为空）时抛出。
+        """
+        if not getattr(self, "document_ids", None):
+            raise ValueError("Index not built. Nothing to save.")
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        state = {
+            "document_ids": self.document_ids,
+            "titles": self.titles,
+            "texts": self.texts,
+            "k1": self.k1,
+            "b": self.b,
+            "term_frequencies": self.term_frequencies,
+            "document_lengths": self.document_lengths,
+            "average_document_length": self.average_document_length,
+            "document_frequencies": self.document_frequencies,
+        }
+        with path.open("wb") as file:
+            pickle.dump(state, file)
+
+    def load(self, path: Path) -> None:
+        """Load a previously persisted BM25 index.
+
+        Args:
+            path: 之前用 save 写出的 pickle 路径。
+        """
+        path = Path(path)
+        with path.open("rb") as file:
+            state = pickle.load(file)
+
+        self.document_ids = state["document_ids"]
+        self.titles = state["titles"]
+        self.texts = state["texts"]
+        self.k1 = state["k1"]
+        self.b = state["b"]
+        self.document_count = len(self.document_ids)
+        self.term_frequencies = state["term_frequencies"]
+        self.document_lengths = state["document_lengths"]
+        self.average_document_length = state["average_document_length"]
+        self.document_frequencies = state["document_frequencies"]
