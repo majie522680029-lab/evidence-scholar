@@ -12,6 +12,11 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     "pydantic>=2.8,<3.0",
     "PyYAML>=6.0,<7.0",
+    "numpy>=1.26,<3.0",
+    "faiss-gpu-cu12>=1.14,<2.0",
+    "sentence-transformers>=6.0,<7.0",
+    # torch 由 sentence-transformers 间接拉取；如需 CUDA 版，
+    # 须用: pip install torch --index-url https://download.pytorch.org/whl/cu121
 ]
 
 [project.optional-dependencies]

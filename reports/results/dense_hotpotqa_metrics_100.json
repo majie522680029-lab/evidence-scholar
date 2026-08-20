@@ -1,0 +1,27 @@
+{
+  "dataset": "hotpotqa_distractor_validation",
+  "evaluation_scope": "per_query_candidate_set",
+  "retriever": "dense",
+  "query_count": 100,
+  "parameters": {
+    "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+    "device": "cuda:0",
+    "batch_size": 64,
+    "normalize_embeddings": true
+  },
+  "metrics": {
+    "recall@1": 0.4,
+    "hit@1": 0.8,
+    "complete_recall@1": 0.0,
+    "recall@2": 0.6,
+    "hit@2": 0.91,
+    "complete_recall@2": 0.29,
+    "recall@5": 0.795,
+    "hit@5": 1.0,
+    "complete_recall@5": 0.59,
+    "recall@10": 1.0,
+    "hit@10": 1.0,
+    "complete_recall@10": 1.0,
+    "mrr": 0.8798333333333334
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "dataset": "hotpotqa_distractor_validation",
+  "evaluation_scope": "per_query_candidate_set",
+  "retriever": "bm25",
+  "query_count": 100,
+  "parameters": {
+    "k1": 1.5,
+    "b": 0.75,
+    "title_weight": 2
+  },
+  "metrics": {
+    "recall@1": 0.395,
+    "hit@1": 0.79,
+    "complete_recall@1": 0.0,
+    "recall@2": 0.635,
+    "hit@2": 0.93,
+    "complete_recall@2": 0.34,
+    "recall@5": 0.87,
+    "hit@5": 1.0,
+    "complete_recall@5": 0.74,
+    "recall@10": 1.0,
+    "hit@10": 1.0,
+    "complete_recall@10": 1.0,
+    "mrr": 0.88
+  }
+}

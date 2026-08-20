@@ -1,0 +1,21 @@
+# EvidenceScholar retrieval configuration.
+# 所有检索器（BM25 / Dense / Hybrid）的参数都从这里读取。
+
+hf:
+  # 国内无法直连 huggingface.co，必须走镜像。
+  endpoint: https://hf-mirror.com
+  cache_dir: ~/.cache/huggingface
+
+bm25:
+  k1: 1.5
+  b: 0.75
+  title_weight: 2
+  top_k: 10
+
+dense:
+  model_name: sentence-transformers/all-MiniLM-L6-v2
+  batch_size: 64
+  normalize_embeddings: true
+  device: cuda:0      # 8×RTX 3090，先用第 0 张
+  top_k: 10
+  index_path: data/indexes/hotpotqa_dense.faiss
