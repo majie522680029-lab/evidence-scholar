@@ -1,0 +1,29 @@
+{
+  "dataset": "hotpotqa_distractor_validation",
+  "evaluation_scope": "per_query_candidate_set",
+  "retriever": "hybrid",
+  "query_count": 100,
+  "parameters": {
+    "method": "rrf",
+    "rrf_k": 60,
+    "bm25_k1": 1.5,
+    "bm25_b": 0.75,
+    "dense_model": "sentence-transformers/all-MiniLM-L6-v2",
+    "dense_device": "cuda:0"
+  },
+  "metrics": {
+    "recall@1": 0.425,
+    "hit@1": 0.85,
+    "complete_recall@1": 0.0,
+    "recall@2": 0.65,
+    "hit@2": 0.93,
+    "complete_recall@2": 0.37,
+    "recall@5": 0.865,
+    "hit@5": 1.0,
+    "complete_recall@5": 0.73,
+    "recall@10": 1.0,
+    "hit@10": 1.0,
+    "complete_recall@10": 1.0,
+    "mrr": 0.9116666666666667
+  }
+}

@@ -19,3 +19,8 @@ dense:
   device: cuda:0      # 8×RTX 3090，先用第 0 张
   top_k: 10
   index_path: data/indexes/hotpotqa_dense.faiss
+
+hybrid:
+  method: rrf            # 融合策略：rrf（倒数排名融合）
+  rrf_k: 60              # RRF 平滑常数，论文默认值
+  top_k: 10
