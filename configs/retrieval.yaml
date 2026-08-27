@@ -24,3 +24,9 @@ hybrid:
   method: rrf            # 融合策略：rrf（倒数排名融合）
   rrf_k: 60              # RRF 平滑常数，论文默认值
   top_k: 10
+
+reranker:
+  model_name: cross-encoder/ms-marco-MiniLM-L-6-v2
+  device: cuda:0          # 与 dense 同卡，MiniLM-L6 显存占用极小
+  max_length: 512         # cross-encoder 输入截断长度
+  candidate_k: 10         # 第一阶段召回的候选数，reranker 对其重排

@@ -1,0 +1,115 @@
+{
+  "dataset": "hotpotqa",
+  "evaluation_scope": "per_query_candidate_set",
+  "query_count": 100,
+  "metric_order": [
+    "hit@1",
+    "hit@2",
+    "hit@5",
+    "hit@10",
+    "recall@1",
+    "recall@2",
+    "recall@5",
+    "recall@10",
+    "complete_recall@2",
+    "complete_recall@5",
+    "complete_recall@10",
+    "mrr"
+  ],
+  "retrievers": {
+    "bm25": {
+      "retriever": "bm25",
+      "parameters": {
+        "k1": 1.5,
+        "b": 0.75,
+        "title_weight": 2
+      },
+      "metrics": {
+        "hit@1": 0.79,
+        "hit@2": 0.93,
+        "hit@5": 1.0,
+        "hit@10": 1.0,
+        "recall@1": 0.395,
+        "recall@2": 0.635,
+        "recall@5": 0.87,
+        "recall@10": 1.0,
+        "complete_recall@2": 0.34,
+        "complete_recall@5": 0.74,
+        "complete_recall@10": 1.0,
+        "mrr": 0.88
+      }
+    },
+    "dense": {
+      "retriever": "dense",
+      "parameters": {
+        "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+        "device": "cuda:0",
+        "batch_size": 64,
+        "normalize_embeddings": true
+      },
+      "metrics": {
+        "hit@1": 0.8,
+        "hit@2": 0.91,
+        "hit@5": 1.0,
+        "hit@10": 1.0,
+        "recall@1": 0.4,
+        "recall@2": 0.6,
+        "recall@5": 0.795,
+        "recall@10": 1.0,
+        "complete_recall@2": 0.29,
+        "complete_recall@5": 0.59,
+        "complete_recall@10": 1.0,
+        "mrr": 0.8798333333333334
+      }
+    },
+    "hybrid": {
+      "retriever": "hybrid",
+      "parameters": {
+        "method": "rrf",
+        "rrf_k": 60,
+        "bm25_k1": 1.5,
+        "bm25_b": 0.75,
+        "dense_model": "sentence-transformers/all-MiniLM-L6-v2",
+        "dense_device": "cuda:0"
+      },
+      "metrics": {
+        "hit@1": 0.85,
+        "hit@2": 0.93,
+        "hit@5": 1.0,
+        "hit@10": 1.0,
+        "recall@1": 0.425,
+        "recall@2": 0.65,
+        "recall@5": 0.865,
+        "recall@10": 1.0,
+        "complete_recall@2": 0.37,
+        "complete_recall@5": 0.73,
+        "complete_recall@10": 1.0,
+        "mrr": 0.9116666666666667
+      }
+    },
+    "reranker": {
+      "retriever": "hybrid+reranker",
+      "parameters": {
+        "stage1": "hybrid (BM25+Dense RRF)",
+        "stage1_rrf_k": 60,
+        "stage2_reranker": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "stage2_device": "cuda:0",
+        "candidate_k": 10
+      },
+      "metrics": {
+        "hit@1": 0.89,
+        "hit@2": 0.95,
+        "hit@5": 0.99,
+        "hit@10": 1.0,
+        "recall@1": 0.445,
+        "recall@2": 0.68,
+        "recall@5": 0.825,
+        "recall@10": 1.0,
+        "complete_recall@2": 0.41,
+        "complete_recall@5": 0.66,
+        "complete_recall@10": 1.0,
+        "mrr": 0.9344444444444444
+      }
+    }
+  }
+}
