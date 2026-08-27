@@ -15,6 +15,7 @@ dependencies = [
     "numpy>=1.26,<3.0",
     "faiss-gpu-cu12>=1.14,<2.0",
     "sentence-transformers>=6.0,<7.0",
+    "openai>=1.0,<4.0",  # 调 vLLM 的 OpenAI 兼容 API（B1 起服务，B3 调用）
     # torch 由 sentence-transformers 间接拉取；如需 CUDA 版，
     # 须用: pip install torch --index-url https://download.pytorch.org/whl/cu121
 ]
