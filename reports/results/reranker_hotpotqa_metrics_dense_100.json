@@ -1,10 +1,10 @@
 {
   "dataset": "hotpotqa_distractor_validation",
   "evaluation_scope": "per_query_candidate_set",
-  "retriever": "hybrid+reranker",
+  "retriever": "dense+reranker",
   "query_count": 100,
   "parameters": {
-    "stage1": "Hybrid(BM25+Dense RRF k=60)",
+    "stage1": "Dense(sentence-transformers/all-MiniLM-L6-v2)",
     "stage2_reranker": "cross-encoder/ms-marco-MiniLM-L-6-v2",
     "stage2_device": "cuda:0",
     "candidate_k": 10

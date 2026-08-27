@@ -1,17 +1,17 @@
 {
   "dataset": "hotpotqa_distractor_validation",
   "evaluation_scope": "per_query_candidate_set",
-  "retriever": "hybrid+reranker",
+  "retriever": "bm25+reranker",
   "query_count": 100,
   "parameters": {
-    "stage1": "Hybrid(BM25+Dense RRF k=60)",
+    "stage1": "BM25",
     "stage2_reranker": "cross-encoder/ms-marco-MiniLM-L-6-v2",
     "stage2_device": "cuda:0",
     "candidate_k": 10
   },
   "metrics": {
-    "recall@1": 0.445,
-    "hit@1": 0.89,
+    "recall@1": 0.45,
+    "hit@1": 0.9,
     "complete_recall@1": 0.0,
     "recall@2": 0.68,
     "hit@2": 0.95,
@@ -22,6 +22,6 @@
     "recall@10": 1.0,
     "hit@10": 1.0,
     "complete_recall@10": 1.0,
-    "mrr": 0.9344444444444444
+    "mrr": 0.9394444444444444
   }
 }

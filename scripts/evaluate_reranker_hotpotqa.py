@@ -1,7 +1,7 @@
-"""Evaluate two-stage retrieval (Hybrid recall + Cross-Encoder rerank) on HotpotQA.
+"""Evaluate two-stage retrieval (stage1 recall + Cross-Encoder rerank) on HotpotQA.
 
 本脚本实现两阶段 RAG 检索的评测：
-1. 第一阶段：Hybrid（BM25+Dense RRF）召回 Top-K 候选；
+1. 第一阶段：由 ``--stage1`` 选定召回器（bm25 / dense / hybrid）召回 Top-K 候选；
 2. 第二阶段：CrossEncoderReranker 对候选精排重打分。
 
 这是检索系统的标准链路：召回保"全"（高 recall），精排保"准"（高 hit@1/MRR）。
@@ -9,6 +9,9 @@
 
 关键特性：reranker 只重排候选、不增删候选，所以 recall@K 不变
 （受限于第一阶段召回率），提升的是 hit@1 / MRR。
+
+消融用法：``--stage1 bm25`` 或 ``--stage1 dense`` 可隔离重排单独贡献，
+与默认 hybrid 路径对比，拆开"融合贡献"与"重排贡献"。
 """
 
 from __future__ import annotations
@@ -70,8 +73,20 @@ def evaluate_reranker(
     *,
     config_path: Path,
     max_queries: int | None,
+    stage1: str = "hybrid",
 ) -> dict[str, Any]:
-    """Evaluate two-stage (Hybrid recall + rerank) retrieval."""
+    """Evaluate two-stage (stage1 recall + rerank) retrieval.
+
+    ``stage1`` selects the first-stage recall retriever, one of
+    ``"bm25"``, ``"dense"``, or ``"hybrid"`` (default). All three feed
+    the same CrossEncoderReranker at stage 2, enabling ablation that
+    isolates the rerank contribution from the fusion contribution.
+    """
+    if stage1 not in ("bm25", "dense", "hybrid"):
+        raise ValueError(
+            f"stage1 must be one of bm25/dense/hybrid, got {stage1!r}."
+        )
+
     config = load_config(config_path)
     bm25_config = config["bm25"]
     dense_config = config["dense"]
@@ -114,37 +129,61 @@ def evaluate_reranker(
 
     maximum_k = max(DEFAULT_K_VALUES)
 
-    # --- 第一阶段：Hybrid 召回器 ---
+    # --- 第一阶段召回器：按 stage1 选择，消融用 ---
     # BM25 子检索器用第一题第一篇候选文档初始化过校验，循环内第一题
-    # build_index 立即覆盖。
+    # build_index 立即覆盖。仅当 stage1 需要它时才建。
     first_doc_id = queries[0]["candidate_document_ids"][0]
     first_doc = documents_by_id[first_doc_id]
-    bm25_retriever = BM25Index(
-        document_ids=[first_doc["document_id"]],
-        tokenized_documents=[
-            build_document_tokens(
-                title=first_doc["title"],
-                text=first_doc["text"],
-            )
-        ],
-        k1=bm25_config["k1"],
-        b=bm25_config["b"],
-        titles=[first_doc["title"]],
-        texts=[first_doc["text"]],
-    )
+    bm25_retriever: BM25Index | None = None
+    dense_retriever: DenseRetriever | None = None
+    hybrid_retriever: HybridRetriever | None = None
 
-    dense_retriever = DenseRetriever(
-        model_name=dense_config["model_name"],
-        device=dense_config["device"],
-        batch_size=dense_config["batch_size"],
-        normalize_embeddings=dense_config["normalize_embeddings"],
-    )
-
-    hybrid_retriever = HybridRetriever(
-        bm25_retriever,
-        dense_retriever,
-        rrf_k=hybrid_config["rrf_k"],
-    )
+    if stage1 == "bm25":
+        bm25_retriever = BM25Index(
+            document_ids=[first_doc["document_id"]],
+            tokenized_documents=[
+                build_document_tokens(
+                    title=first_doc["title"],
+                    text=first_doc["text"],
+                )
+            ],
+            k1=bm25_config["k1"],
+            b=bm25_config["b"],
+            titles=[first_doc["title"]],
+            texts=[first_doc["text"]],
+        )
+    elif stage1 == "dense":
+        dense_retriever = DenseRetriever(
+            model_name=dense_config["model_name"],
+            device=dense_config["device"],
+            batch_size=dense_config["batch_size"],
+            normalize_embeddings=dense_config["normalize_embeddings"],
+        )
+    else:  # stage1 == "hybrid"
+        bm25_retriever = BM25Index(
+            document_ids=[first_doc["document_id"]],
+            tokenized_documents=[
+                build_document_tokens(
+                    title=first_doc["title"],
+                    text=first_doc["text"],
+                )
+            ],
+            k1=bm25_config["k1"],
+            b=bm25_config["b"],
+            titles=[first_doc["title"]],
+            texts=[first_doc["text"]],
+        )
+        dense_retriever = DenseRetriever(
+            model_name=dense_config["model_name"],
+            device=dense_config["device"],
+            batch_size=dense_config["batch_size"],
+            normalize_embeddings=dense_config["normalize_embeddings"],
+        )
+        hybrid_retriever = HybridRetriever(
+            bm25_retriever,
+            dense_retriever,
+            rrf_k=hybrid_config["rrf_k"],
+        )
 
     # --- 第二阶段：Cross-Encoder Reranker ---
     reranker = CrossEncoderReranker(
@@ -153,8 +192,14 @@ def evaluate_reranker(
         max_length=reranker_config["max_length"],
     )
 
+    stage1_desc = {
+        "bm25": "BM25",
+        "dense": f"Dense({dense_config['model_name']})",
+        "hybrid": f"Hybrid(BM25+Dense RRF k={hybrid_config['rrf_k']})",
+    }[stage1]
+
     print(
-        f"Two-stage initialized: Hybrid recall Top-{candidate_k} -> "
+        f"Two-stage initialized: {stage1} recall Top-{candidate_k} -> "
         f"rerank({reranker_config['model_name']} on "
         f"{reranker_config['device']})"
     )
@@ -196,9 +241,19 @@ def evaluate_reranker(
             for document_id in candidate_document_ids
         ]
 
-        # 第一阶段：Hybrid 召回 candidate_k 个候选。
-        hybrid_retriever.build_index(candidate_documents)
-        candidates = hybrid_retriever.search(query_text, top_k=candidate_k)
+        # 第一阶段：按 stage1 选定的召回器召回 candidate_k 个候选。
+        if stage1 == "bm25":
+            assert bm25_retriever is not None
+            stage1_retriever = bm25_retriever
+        elif stage1 == "dense":
+            assert dense_retriever is not None
+            stage1_retriever = dense_retriever
+        else:
+            assert hybrid_retriever is not None
+            stage1_retriever = hybrid_retriever
+
+        stage1_retriever.build_index(candidate_documents)
+        candidates = stage1_retriever.search(query_text, top_k=candidate_k)
 
         # 第二阶段：reranker 对候选重排，取 maximum_k 个。
         results = reranker.rerank(
@@ -267,11 +322,10 @@ def evaluate_reranker(
     summary = {
         "dataset": "hotpotqa_distractor_validation",
         "evaluation_scope": "per_query_candidate_set",
-        "retriever": "hybrid+reranker",
+        "retriever": f"{stage1}+reranker",
         "query_count": query_count,
         "parameters": {
-            "stage1": "hybrid (BM25+Dense RRF)",
-            "stage1_rrf_k": hybrid_config["rrf_k"],
+            "stage1": stage1_desc,
             "stage2_reranker": reranker_config["model_name"],
             "stage2_device": reranker_config["device"],
             "candidate_k": candidate_k,
@@ -281,10 +335,17 @@ def evaluate_reranker(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    suffix = f"_{query_count}" if max_queries is not None else ""
+    count_suffix = f"_{query_count}" if max_queries is not None else ""
+    stage1_suffix = "" if stage1 == "hybrid" else f"_{stage1}"
 
-    metrics_path = output_dir / f"reranker_hotpotqa_metrics{suffix}.json"
-    rankings_path = output_dir / f"reranker_hotpotqa_rankings{suffix}.jsonl"
+    metrics_path = (
+        output_dir
+        / f"reranker_hotpotqa_metrics{stage1_suffix}{count_suffix}.json"
+    )
+    rankings_path = (
+        output_dir
+        / f"reranker_hotpotqa_rankings{stage1_suffix}{count_suffix}.jsonl"
+    )
 
     with metrics_path.open("w", encoding="utf-8") as file:
         json.dump(summary, file, ensure_ascii=False, indent=2)
@@ -296,10 +357,10 @@ def evaluate_reranker(
             file.write("\n")
 
     print()
-    print("Two-stage (Hybrid + Reranker) evaluation completed.")
+    print(f"Two-stage ({stage1} + Reranker) evaluation completed.")
     print(f"Queries evaluated: {query_count}")
     print(
-        f"Parameters: stage1=Hybrid(rrf_k={hybrid_config['rrf_k']}), "
+        f"Parameters: stage1={stage1_desc}, "
         f"candidate_k={candidate_k}, "
         f"stage2={reranker_config['model_name']} on "
         f"{reranker_config['device']}"
@@ -333,6 +394,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Evaluate only the first N queries.",
     )
+    parser.add_argument(
+        "--stage1",
+        type=str,
+        default="hybrid",
+        choices=("bm25", "dense", "hybrid"),
+        help="First-stage recall retriever. Default hybrid. "
+        "Use bm25/dense for ablation to isolate the rerank contribution.",
+    )
 
     return parser.parse_args()
 
@@ -346,6 +415,7 @@ def main() -> None:
         output_dir=args.output_dir,
         config_path=args.config_path,
         max_queries=args.max_queries,
+        stage1=args.stage1,
     )
 
 
