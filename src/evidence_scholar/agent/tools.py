@@ -1,11 +1,26 @@
-"""Tool-calling layer: expose retrievers as OpenAI-format tools for an LLM agent.
+"""Tool-calling layer: expose retrievers + judge as OpenAI-format tools.
 
 B2 的职责：把检索器包装成 LLM 能通过 tool-calling 协议调用的"工具"。
+B5 在此基础上加了第二个工具 judge_evidence——让 LLM 通过 tool_call
+表达"证据充分性判断"，而不是输出 JSON 文本。
 
-为什么单独一层：
-- agent loop（B3）只管"调 LLM → 解析 tool_call → 执行 → 喂回 LLM"的循环逻辑，
-  不该同时操心"工具签名对不对、参数校验、结果怎么序列化成 LLM 能读的文本"。
-  把工具层单独抽出来，先单独测通，loop 写起来只需管控制流。
+为什么 judge 也用工具表达（B5 的关键设计调整）：
+- 原设计让 judge 输出 JSON 字符串（guided_json / JSON mode）。但 Qwen3
+  默认开 thinking mode，思考文本会裹在 JSON 前、甚至占满 max_tokens 把
+  JSON 挤没，实测 guided_json 约束不住 thinking。
+- tool calling 走专用结构化通道：vLLM 的 tool-call parser（hermes）在
+  解码阶段就约束 tool_call 参数满足 schema，thinking 影响 content 不影响
+  tool_call 参数。联调已证明 Qwen3 的 retrieve_hybrid tool_call 参数 JSON
+  完全正确，复用这条稳的通道表达 judge 判断。
+- 这样 agent 只会"调工具"一种结构化动作，架构统一，不引入 JSON 模式第二套
+  结构化机制。
+
+JSON 不稳的五层防御（针对截断/漂移/思考混入）：
+1. tool calling 通道治本（最稳的结构化路径）
+2. judge 调用放宽 max_tokens（让参数有空间生成完）
+3. 客户端解析容错（JSON 解析失败兜底成空 dict，不崩 loop）
+4. judge schema 精简：reason 限 maxLength 防小作文截断，sufficient 必填防漂移
+5. B3 loop 的 max_steps 兜底（judge 全坏了也不死循环）
 
 设计要点：
 - 工具层不持有索引生命周期。构造时传入一个已 build_index 过的 retriever，
@@ -13,8 +28,6 @@ B2 的职责：把检索器包装成 LLM 能通过 tool-calling 协议调用的"
   纯逻辑，可用 fake retriever 单元测试，不碰 GPU/真模型。
 - 返回给 LLM 的是结构化文本（标题 + 正文片段），不是原始 pydantic 对象——
   LLM 只能读文本。正文做长度截断，防爆上下文。
-- B2 只暴露 hybrid 一个工具（单工具起步），让 agent 先把 loop 跑通；
-  后续可开放 bm25/dense 多工具让 agent 学选择策略。
 """
 
 from __future__ import annotations
@@ -62,6 +75,7 @@ class RetrievalTools:
 
     # 工具名固定常量，避免散落字符串拼写错误。
     HYBRID_TOOL_NAME = "retrieve_hybrid"
+    JUDGE_TOOL_NAME = "judge_evidence"
 
     def __init__(self, retriever: BaseRetriever) -> None:
         """Initialize with an already-indexed retriever.
@@ -77,8 +91,8 @@ class RetrievalTools:
     def schema(self) -> list[dict[str, Any]]:
         """OpenAI tools 格式的工具签名列表。
 
-        每个工具含 name / description / parameters(JSON Schema)。这个列表
-        原样塞进 LLM 请求的 `tools` 字段即可。
+        两个工具：retrieve_hybrid（查证据）+ judge_evidence（判够不够）。
+        原样塞进 LLM 请求的 tools 字段。
         """
         return [
             {
@@ -119,7 +133,59 @@ class RetrievalTools:
                         "required": ["query"],
                     },
                 },
-            }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": self.JUDGE_TOOL_NAME,
+                    "description": (
+                        "Judge whether the evidence gathered so far is "
+                        "sufficient to answer the user's question. Call "
+                        "this after every retrieval. If sufficient is "
+                        "true, provide the final answer. If false, "
+                        "provide next_query for the next retrieval. "
+                        "Always call this before answering."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "sufficient": {
+                                "type": "boolean",
+                                "description": (
+                                    "True if gathered evidence is enough "
+                                    "to answer the question."
+                                ),
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": (
+                                    "Why sufficient or not. If not, "
+                                    "state what is still missing."
+                                ),
+                                # maxLength 防模型写小作文撑爆 max_tokens、
+                                # 把整个 tool_call 参数截断（防御层 4）。
+                                "maxLength": 200,
+                            },
+                            "next_query": {
+                                "type": "string",
+                                "description": (
+                                    "Only when sufficient is false: the "
+                                    "focused query to search next."
+                                ),
+                            },
+                            "answer": {
+                                "type": "string",
+                                "description": (
+                                    "Only when sufficient is true: the "
+                                    "final answer grounded in evidence."
+                                ),
+                            },
+                        },
+                        # sufficient 必填，防漂移（防御层 4）。
+                        "required": ["sufficient"],
+                    },
+                },
+            },
         ]
 
     def execute(
@@ -132,18 +198,26 @@ class RetrievalTools:
             arguments: 工具参数（来自 LLM 的 tool_call.arguments 解析后的 dict）。
 
         Returns:
-            JSON 字符串，含 documents 列表（或 error 字段）。JSON 是为了让
-            LLM 看到结构化字段（rank/title/text），而不是一坨自由文本。
+            JSON 字符串，含 documents 列表（retrieve_hybrid）或 judge 回执
+            （judge_evidence）。JSON 让 LLM 看到结构化字段，而非自由文本。
 
         Raises:
-            ValueError: 工具名未知，或参数不合法（query 空/top_k 越界）。
+            ValueError: 工具名未知，或参数不合法。
         """
-        if name != self.HYBRID_TOOL_NAME:
-            raise ValueError(
-                f"Unknown tool name: {name!r}. "
-                f"Expected {self.HYBRID_TOOL_NAME!r}."
-            )
+        if name == self.JUDGE_TOOL_NAME:
+            return self._execute_judge(arguments)
 
+        if name == self.HYBRID_TOOL_NAME:
+            return self._execute_hybrid(arguments)
+
+        raise ValueError(
+            f"Unknown tool name: {name!r}. "
+            f"Expected one of {self.HYBRID_TOOL_NAME!r}, "
+            f"{self.JUDGE_TOOL_NAME!r}."
+        )
+
+    def _execute_hybrid(self, arguments: dict[str, Any]) -> str:
+        """retrieve_hybrid 的执行：真去查语料，返回文档列表。"""
         query = arguments.get("query")
         if not isinstance(query, str) or not query.strip():
             raise ValueError(
@@ -184,3 +258,56 @@ class RetrievalTools:
             }
 
         return json.dumps(payload, ensure_ascii=False)
+
+    def _execute_judge(self, arguments: dict[str, Any]) -> str:
+        """judge_evidence 的执行：不查语料，只回执确认 + 透传判断。
+
+        judge 是"声明判断"不是"执行动作"——它告诉 loop 够不够/下一步查啥，
+        本身不需要副作用。execute 回执一个确认消息给 LLM，让 LLM 知道判断
+        已记录（loop 会据 sufficient 决定作答或继续）。
+        """
+        sufficient = arguments.get("sufficient")
+        # 容错：LLM 偶尔把 boolean 传成字符串。
+        if isinstance(sufficient, str):
+            sufficient = sufficient.strip().lower() in ("true", "1", "yes")
+        if not isinstance(sufficient, bool):
+            raise ValueError(
+                f"Argument 'sufficient' must be a boolean, "
+                f"got {type(sufficient).__name__}."
+            )
+
+        reason = arguments.get("reason", "")
+        # next_query/answer 透传，loop 用 parse_judge 取走。
+        ack = {
+            "judged": True,
+            "sufficient": sufficient,
+            "reason": str(reason)[:300],  # 防超长
+            "next_query": arguments.get("next_query"),
+            "answer": arguments.get("answer"),
+        }
+        return json.dumps(ack, ensure_ascii=False)
+
+    def parse_judge(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """从 judge 的 tool_call 参数里取出结构化判断（供 loop 决策）。
+
+        和 _execute_judge 分开：execute 是"执行+回执"，parse_judge 是
+        "提取决策依据"。loop 在检测到 judge 调用时调它，读 sufficient/
+        next_query/answer 决定走作答还是继续检索。
+
+        容错（防御层 3/4）：sufficient 解析失败默认 False（保守，倾向继续
+        检索而非过早作答）；缺 answer 时给空串。
+        """
+        sufficient_raw = arguments.get("sufficient")
+        if isinstance(sufficient_raw, str):
+            sufficient = sufficient_raw.strip().lower() in ("true", "1", "yes")
+        elif isinstance(sufficient_raw, bool):
+            sufficient = sufficient_raw
+        else:
+            sufficient = False  # 解析不出就当"不够"，保守不乱答。
+
+        return {
+            "sufficient": sufficient,
+            "next_query": arguments.get("next_query"),
+            "answer": arguments.get("answer") or "",
+            "reason": arguments.get("reason", ""),
+        }

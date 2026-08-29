@@ -60,11 +60,13 @@ def tools(three_results: list[RetrievalResult]) -> RetrievalTools:
 
 # --- schema 格式 ---
 
-def test_schema_is_list_of_one_tool(tools: RetrievalTools) -> None:
-    """B2 单工具起步：schema 只暴露 retrieve_hybrid 一个工具。"""
+def test_schema_has_two_tools(tools: RetrievalTools) -> None:
+    """B5 后两个工具：retrieve_hybrid + judge_evidence。"""
     schema = tools.schema
     assert isinstance(schema, list)
-    assert len(schema) == 1
+    assert len(schema) == 2
+    names = [t["function"]["name"] for t in schema]
+    assert names == ["retrieve_hybrid", "judge_evidence"]
 
 
 def test_schema_tool_has_openai_function_shape(tools: RetrievalTools) -> None:
@@ -198,3 +200,96 @@ def test_execute_rejects_non_integer_topk(tools: RetrievalTools) -> None:
     """top_k 非 int 报错。"""
     with pytest.raises(ValueError, match="integer"):
         tools.execute("retrieve_hybrid", {"query": "q", "top_k": "ten"})
+
+
+# --- B5: judge_evidence 工具 ---
+
+def test_judge_schema_shape(tools: RetrievalTools) -> None:
+    """judge 工具 schema 有 sufficient 必填 + reason maxLength 约束。"""
+    judge = tools.schema[1]["function"]
+    assert judge["name"] == "judge_evidence"
+    params = judge["parameters"]["properties"]
+    assert "sufficient" in params
+    assert params["sufficient"]["type"] == "boolean"
+    # reason 限 maxLength（防小作文截断）。
+    assert "maxLength" in params["reason"]
+    # sufficient 必填。
+    assert "sufficient" in judge["parameters"]["required"]
+
+
+def test_judge_execute_sufficient_true(tools: RetrievalTools) -> None:
+    """judge sufficient=true 时 execute 回执 + 透传 answer。"""
+    out = tools.execute("judge_evidence", {
+        "sufficient": True, "reason": "have both", "answer": "yes"
+    })
+    parsed = json.loads(out)
+    assert parsed["judged"] is True
+    assert parsed["sufficient"] is True
+    assert parsed["answer"] == "yes"
+
+
+def test_judge_execute_sufficient_false(tools: RetrievalTools) -> None:
+    """judge sufficient=false 时透传 next_query。"""
+    out = tools.execute("judge_evidence", {
+        "sufficient": False, "reason": "need X", "next_query": "X nationality"
+    })
+    parsed = json.loads(out)
+    assert parsed["sufficient"] is False
+    assert parsed["next_query"] == "X nationality"
+
+
+def test_judge_execute_accepts_string_boolean(tools: RetrievalTools) -> None:
+    """LLM 偶尔把 boolean 传成字符串 'true'，execute 容错。"""
+    out = tools.execute("judge_evidence", {"sufficient": "true", "reason": ""})
+    assert json.loads(out)["sufficient"] is True
+
+
+def test_judge_execute_rejects_missing_sufficient(tools: RetrievalTools) -> None:
+    """缺 sufficient 报错（防漂移，必填）。"""
+    with pytest.raises(ValueError, match="sufficient"):
+        tools.execute("judge_evidence", {"reason": "no sufficient"})
+
+
+def test_parse_judge_sufficient_true(tools: RetrievalTools) -> None:
+    """parse_judge 从参数取 sufficient=True + answer。"""
+    parsed = tools.parse_judge({
+        "sufficient": True, "answer": "American", "reason": "got both"
+    })
+    assert parsed["sufficient"] is True
+    assert parsed["answer"] == "American"
+
+
+def test_parse_judge_sufficient_false(tools: RetrievalTools) -> None:
+    """parse_judge 取 sufficient=False + next_query。"""
+    parsed = tools.parse_judge({
+        "sufficient": False, "next_query": "X age", "reason": "miss age"
+    })
+    assert parsed["sufficient"] is False
+    assert parsed["next_query"] == "X age"
+
+
+def test_parse_judge_missing_sufficient_defaults_false(
+    tools: RetrievalTools,
+) -> None:
+    """sufficient 解析不出时默认 False（保守，倾向继续检索不乱答）。"""
+    parsed = tools.parse_judge({"reason": "no sufficient field"})
+    assert parsed["sufficient"] is False
+
+
+def test_parse_judge_missing_answer_defaults_empty(
+    tools: RetrievalTools,
+) -> None:
+    """缺 answer 给空串而非 None（loop 拼答案时不崩）。"""
+    parsed = tools.parse_judge({"sufficient": True})
+    assert parsed["answer"] == ""
+
+
+def test_judge_execute_truncates_long_reason(tools: RetrievalTools) -> None:
+    """超长 reason 被截断（防回执撑爆上下文）。"""
+    out = tools.execute("judge_evidence", {
+        "sufficient": True,
+        "reason": "x" * 1000,
+        "answer": "a",
+    })
+    parsed = json.loads(out)
+    assert len(parsed["reason"]) <= 300

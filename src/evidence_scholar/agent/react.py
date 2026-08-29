@@ -1,18 +1,27 @@
-"""ReAct agent loop (B3): Reason + Act over retrieval tools.
+"""ReAct agent loop (B3 + B5): Reason + Act over retrieval tools + evidence judge.
 
 B3 是 v2 agent 的"大脑"——手写 ReAct 循环。为什么手写而非直接上
 LangGraph：实习要求 #3 明确要"自己实现 ReAct Agent"。手写一遍才真懂
 agent 的运行机制（消息配对、终止判定、循环兜底），C2 用 LangGraph
 重写时才有对比、能讲"框架替我解决了什么"。
 
+B5 给循环加了 Evidence Judge + Query Rewrite 的退出语义：LLM 不再靠
+"停止调工具"作答，而是显式调 judge_evidence 工具，用结构化字段
+（sufficient/next_query/answer）宣告"够不够"。判定结构走 tool-call
+通道产出（B5 方案 3），绕开 Qwen3 thinking 混进 content 破坏 JSON 的
+稳定性问题——hermes parser 在 decode 期就约束了 tool_call 参数。
+
 ReAct 循环（每跳 Reason + Act）：
     messages = [system + user]
     while step < max_steps:
         response = llm.chat(messages, tools)          # LLM 想一下
-        if response 无 tool_call:
-            return answer                              # LLM 自己答了 → 收
+        if response 无 tool_call:                     # 退出 A（B3 兜底）
+            return response.text
+        tool_call = response.tool_call
         result = tools.execute(tool_call)              # 执行 LLM 指派的动作
         messages += [assistant(tool_call), tool(result)]  # 喂回 LLM 观察
+        if tool_call 是 judge 且 sufficient=true:      # 退出 B（B5 主路径）
+            return judge.answer
         step += 1
     return None (max_steps 兜底)                        # LLM 无限要工具 → 截停
 
@@ -20,8 +29,13 @@ ReAct 循环（每跳 Reason + Act）：
 - llm_client 是 Protocol，不绑死具体后端。B3 测试用 FakeLLM 注入，
   真跑用 OpenAICompatibleClient（B1 vLLM 起来后接）。这层抽象让循环
   逻辑可独立测试，不碰 GPU/网络。
-- 循环退出两条件：LLM 主动停止要工具（成功）/ 超 max_steps（兜底）。
-  B3 不加 Evidence Judge——LLM 自己决定答不答，B5 才加"判够不够"。
+- 循环退出两路径：退出 A=LLM 主动停要工具（成功，text 作答）/ 退出 B=
+  LLM 调 judge_evidence 且 sufficient=true（成功，结构化 answer 作答）。
+  超 max_steps 仍兜底截停。两条成功路径并存增强鲁棒——LLM 忘了调
+  judge 直接 text 作答也能收。
+- judge sufficient=false 不退出：把 ack（含 next_query）塞回 LLM，
+  让 LLM 下一跳自己拿 next_query 去 retrieve。保持 LLM 是控制器，
+  这是 ReAct 的核心；不硬塞检索动作。
 - 每跳记 trace（tool 名/参数/结果），是 B7 Langfuse 的本地雏形。
 - tool_call 出错（未知工具/参数非法）不崩循环——把错误塞回 LLM 让它
   自己修正，这是 agent 鲁棒性的关键（LLM 会给错参数，不能一崩了之）。
@@ -188,10 +202,15 @@ def run_agent(
 ) -> AgentResult:
     """Run the ReAct loop until the LLM answers or max_steps is hit.
 
+    两条成功退出：A=LLM 不再调工具（text 作答，B3 兜底）/ B=LLM 调
+    judge_evidence 且 sufficient=true（结构化 answer 作答，B5 主路径）。
+    超 max_steps 兜底截停，answer=None。
+
     Args:
         question: 用户问题。
         llm_client: LLM 后端（真跑用 OpenAICompatibleClient，测试用 FakeLLM）。
-        tools: 已初始化的检索工具层（B2 的 RetrievalTools）。
+        tools: 已初始化的检索工具层（B2/B5 的 RetrievalTools，含 retrieve
+            + judge 两工具）。
         max_steps: 最大跳数兜底，防 LLM 无限调工具。
         system_prompt: 自定义 system 提示。默认用 ReAct agent 通用提示。
 
@@ -217,7 +236,9 @@ def run_agent(
     while state.step < max_steps:
         response = llm_client.chat(state.messages, tools=tool_schema)
 
-        # 分支 1：LLM 不再要工具 → 它在作答 → 成功退出。
+        # 退出 A（B3 原有，保留为兜底）：LLM 不再要工具 → 它在作答 → 成功退出。
+        # B5 下这是次要路径——主路径走 judge；但 LLM 若忘调 judge 直接 text
+        # 作答，这条路径仍能收尾，增强鲁棒。
         if not response.wants_tool:
             answer = response.text or ""
             state.append_assistant_text(answer)
@@ -229,7 +250,7 @@ def run_agent(
                 messages=state.messages,
             )
 
-        # 分支 2：LLM 要调工具 → 执行 → 喂回结果 → 下一跳。
+        # 分支 2：LLM 要调工具 → 执行 → 喂回结果 → 看是否 judge 退出。
         tool_call = response.tool_call
         assert tool_call is not None  # wants_tool 已保证
 
@@ -238,14 +259,16 @@ def run_agent(
         # 仍需完整——否则下一跳 LLM 看到一个悬空 tool_call 会困惑）。
         state.append_assistant_tool_call(tool_call, text=response.text)
 
+        executed_ok = True
         try:
             result = tools.execute(tool_call.name, tool_call.arguments)
             step_record.tool_result = result
             state.append_tool_result(tool_call.id, result)
         except (ValueError, KeyError) as error:
             # tool 执行失败（未知工具名/参数非法等）：不崩循环，把错误
-            # 描述塞回 LLM，让它自己看到错误并修正下一跳。这是 agent
-            # 鲁棒性的关键——LLM 经常传错参数，不能一崩了之。
+            # 描述塞回 LLM，让它自己看到错误并修正下一跳。是 agent 鲁棒
+            # 性的关键——LLM 经常传错参数，不能一崩了之。
+            executed_ok = False
             err_msg = f"Tool execution failed: {error}"
             step_record.error = err_msg
             logger.warning(
@@ -253,6 +276,26 @@ def run_agent(
                 state.step, tool_call.name, error,
             )
             state.append_tool_result(tool_call.id, err_msg)
+
+        # 退出 B（B5 新增）：judge 判定 sufficient → 用结构化 answer 退出。
+        # 只在执行成功时判（执行失败已塞回 LLM 自修正，不在此退出）。
+        # sufficient=false 不退出：ack 含 next_query，下一跳 LLM 自己拿去
+        # retrieve，保持 LLM 是控制器（ReAct 核心）。
+        if executed_ok and tool_call.name == tools.JUDGE_TOOL_NAME:
+            judge = tools.parse_judge(tool_call.arguments)
+            if judge["sufficient"]:
+                # 优先用 judge 结构化 answer；空则回退 LLM 这一跳的 text；
+                # 再空则空串。多级兜底防 LLM 把答案塞错地方。
+                answer = judge["answer"] or response.text or ""
+                trace.append(step_record)
+                state.step += 1
+                return AgentResult(
+                    answer=answer,
+                    steps=state.step,
+                    stopped_reason="answered",
+                    trace=trace,
+                    messages=state.messages,
+                )
 
         trace.append(step_record)
         state.step += 1
@@ -269,10 +312,13 @@ def run_agent(
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are an evidence-grounded research agent. To answer the user's "
-    "question, you may call the retrieve_hybrid tool to search a document "
-    "corpus. Reformulate the question into focused retrieval queries and "
-    "gather evidence across multiple rounds if the question is multi-hop. "
-    "When you have enough evidence, answer directly without calling any "
-    "tool. If a tool call fails, read the error and adjust your next call. "
-    "Keep answers grounded in retrieved evidence."
+    "question, call the retrieve_hybrid tool to search a document corpus; "
+    "reformulate the question into focused retrieval queries and gather "
+    "evidence across multiple rounds if the question is multi-hop. After "
+    "gathering evidence, call the judge_evidence tool to decide whether the "
+    "evidence is sufficient: set sufficient=true and write the final answer "
+    "in the answer field when ready, or set sufficient=false with a sharper "
+    "next_query to retrieve more. You are done once judge_evidence returns "
+    "sufficient=true. If a tool call fails, read the error and adjust your "
+    "next call. Keep answers grounded in retrieved evidence."
 )

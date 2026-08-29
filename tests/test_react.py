@@ -1,14 +1,19 @@
-"""Tests for the ReAct agent loop (B3).
+"""Tests for the ReAct agent loop (B3 + B5).
 
 FakeLLM 注入预设返回序列，不调真 LLM/不占 GPU。和 A 阶段检索器测试、
 B2 工具层测试同套路，秒级跑完。
 
-覆盖 5 个场景：
-1. 单跳收敛：FakeLLM 第 1 跳直接作答 → loop 1 步退出。
-2. 两跳收敛：第 1 跳 tool_call + 第 2 跳作答 → 2 步退出，消息配对正确。
+覆盖 7 个场景：
+1. 单跳收敛（退出 A）：FakeLLM 第 1 跳直接 text 作答 → loop 1 步退出。
+2. 两跳收敛（退出 A）：第 1 跳 tool_call + 第 2 跳 text 作答 → 2 步退出，
+   消息配对正确。
 3. max_steps 兜底：FakeLLM 永远要工具 → 超限退出，answer=None。
 4. 消息配对：第 2 跳 FakeLLM 能"看到"第 1 跳的 tool 结果（验证喂回对）。
 5. 异常 tool_call：LLM 给未知工具名 → 循环不崩，错误喂回 LLM。
+6. judge 退出（退出 B，B5 主路径）：LLM 调 judge_evidence sufficient=true →
+   用结构化 answer 退出，不再多跑一跳。
+7. judge insufficient：LLM 调 judge sufficient=false → 不退出，ack 喂回，
+   下一跳继续（验证 LLM 仍是控制器，sufficient=false 不截停）。
 """
 
 from __future__ import annotations
@@ -203,6 +208,147 @@ def test_bad_tool_args_fed_back(tools: RetrievalTools) -> None:
     second_tool_content = fake.calls_messages[1][3]["content"]
     assert "failed" in second_tool_content.lower() or "non-empty" in second_tool_content
     assert result.trace[0].error is not None
+
+
+# --- 场景 6：judge sufficient=true 退出（B5 主路径，退出 B）---
+
+def test_judge_sufficient_exits_with_structured_answer(
+    tools: RetrievalTools,
+) -> None:
+    """LLM 调 judge_evidence sufficient=true → 用 judge.answer 退出，1 跳完。
+
+    这是 B5 的主退出路径。关键：退出用的是 judge 结构化 answer 字段，
+    不是 LLM text，也不是多跑一跳。停止原因仍是 answered。
+    """
+    judge_call = LLMResponse(
+        tool_call=ToolCall(
+            id="j1", name="judge_evidence",
+            arguments={"sufficient": True, "answer": "Paris",
+                       "reason": "found capital", "next_query": ""},
+        )
+    )
+    fake = FakeLLM([judge_call])
+    result = run_agent("capital of France?", llm_client=fake, tools=tools)
+
+    assert result.answer == "Paris"
+    assert result.steps == 1
+    assert result.stopped_reason == "answered"
+    # trace 记了 judge 这跳。
+    assert result.trace[-1].tool_call.name == "judge_evidence"
+
+
+def test_judge_answer_empty_falls_back_to_text(tools: RetrievalTools) -> None:
+    """judge sufficient=true 但 answer 字段空 → 回退用 LLM 这一跳的 text。
+
+    多级兜底：LLM 可能把答案写进 content 而非 judge.answer，仍能收尾。
+    """
+    judge_call = LLMResponse(
+        text="The answer is Paris.",
+        tool_call=ToolCall(
+            id="j2", name="judge_evidence",
+            arguments={"sufficient": True, "answer": "",
+                       "reason": "done", "next_query": ""},
+        )
+    )
+    fake = FakeLLM([judge_call])
+    result = run_agent("capital of France?", llm_client=fake, tools=tools)
+
+    assert result.answer == "The answer is Paris."
+    assert result.stopped_reason == "answered"
+
+
+def test_judge_sufficient_after_retrieval(tools: RetrievalTools) -> None:
+    """两跳：先 retrieve 收证据，再 judge sufficient=true → 2 步退出。
+
+    更接近真实多跳流程：retrieve → judge（够）→ 出答案。
+    """
+    judge_call = LLMResponse(
+        tool_call=ToolCall(
+            id="j3", name="judge_evidence",
+            arguments={"sufficient": True, "answer": "yes",
+                       "reason": "evidence found", "next_query": ""},
+        )
+    )
+    fake = FakeLLM([_tool_call(), judge_call])
+    result = run_agent("multi-hop q", llm_client=fake, tools=tools)
+
+    assert result.answer == "yes"
+    assert result.steps == 2
+    assert result.stopped_reason == "answered"
+    # 第 1 跳 retrieve、第 2 跳 judge。
+    assert result.trace[0].tool_call.name == "retrieve_hybrid"
+    assert result.trace[1].tool_call.name == "judge_evidence"
+
+
+# --- 场景 7：judge sufficient=false 不退出 ---
+
+def test_judge_insufficient_does_not_exit(tools: RetrievalTools) -> None:
+    """LLM 调 judge sufficient=false → 不退出，ack 喂回，继续跑下一跳。
+
+    sufficient=false 表示证据不够。ack（含 next_query）塞回 LLM，下一跳
+    LLM 自己拿 next_query 去 retrieve。保持 LLM 是控制器（ReAct 核心），
+    不硬塞检索动作。
+    """
+    judge_insufficient = LLMResponse(
+        tool_call=ToolCall(
+            id="j4", name="judge_evidence",
+            arguments={"sufficient": False, "answer": "",
+                       "reason": "need more", "next_query": "sharper q"},
+        )
+    )
+    # judge 之后 FakeLLM 再作答收尾。
+    fake = FakeLLM([judge_insufficient, _answer("final after more retrieval")])
+    result = run_agent("q", llm_client=fake, tools=tools)
+
+    # 没有在 judge 这步退出——继续跑到第 2 跳作答。
+    assert result.answer == "final after more retrieval"
+    assert result.steps == 2
+    assert result.stopped_reason == "answered"
+    # judge 的 ack 确实喂回了第 2 跳的 LLM（消息含 tool 角色 ack）。
+    second_call_msgs = fake.calls_messages[1]
+    assert second_call_msgs[2]["role"] == "assistant"
+    assert second_call_msgs[3]["role"] == "tool"
+    ack_content = second_call_msgs[3]["content"]
+    # ack 含 next_query 字段，LLM 下一跳能看到改写后的 query。
+    assert "sharper q" in ack_content or "next_query" in ack_content
+
+
+def test_judge_then_retrieve_then_judge_exit(tools: RetrievalTools) -> None:
+    """完整多跳路径：retrieve → judge(不足) → retrieve → judge(足) → 退出。
+
+    最贴近真实 ReAct 的多跳收敛。judge 两次：第一次不足继续，第二次足退出。
+    """
+    retrieve2 = LLMResponse(
+        tool_call=ToolCall(id="r2", name="retrieve_hybrid",
+                           arguments={"query": "second hop"})
+    )
+    judge_enough = LLMResponse(
+        tool_call=ToolCall(
+            id="j5", name="judge_evidence",
+            arguments={"sufficient": True, "answer": "the final answer",
+                       "reason": "complete", "next_query": ""},
+        )
+    )
+    judge_not_enough = LLMResponse(
+        tool_call=ToolCall(
+            id="j6", name="judge_evidence",
+            arguments={"sufficient": False, "answer": "",
+                       "reason": "incomplete", "next_query": "second hop"},
+        )
+    )
+    fake = FakeLLM([
+        _tool_call(q="first hop"),   # 1. 先检索
+        judge_not_enough,            # 2. 判不够，给 next_query
+        retrieve2,                   # 3. 再检索（next hop）
+        judge_enough,                # 4. 判够 → 退出
+    ])
+    result = run_agent("multi-hop q", llm_client=fake, tools=tools)
+
+    assert result.answer == "the final answer"
+    assert result.steps == 4
+    assert result.stopped_reason == "answered"
+    # 调了两次检索器。
+    assert len(tools._retriever.calls) == 2  # type: ignore[attr-defined]
 
 
 # --- 边界 ---
