@@ -1,0 +1,25 @@
+{
+  "num_queries": 100,
+  "em": 0.2,
+  "f1": 0.36463745227023103,
+  "converge_rate": 0.99,
+  "max_steps_fallback_rate": 0.01,
+  "avg_steps": 2.3737373737373737,
+  "yesno_subset": {
+    "total": 12,
+    "correct": 10,
+    "accuracy": 0.8333333333333334
+  },
+  "judge_quality": {
+    "judge_true_total": 98,
+    "judge_true_correct": 20,
+    "precision": 0.20408163265306123
+  },
+  "findings": [
+    "EM=0.200 / F1=0.365（EM 严/F1 松，真实水平在中间）",
+    "收敛率=0.990，max_steps 截停率=0.010",
+    "平均跳数=2.37（收敛题，验多跳行为是否发生）",
+    "yes/no 子集准确率=0.833（10/12）",
+    "judge 判够且答对率=0.204（20/98，测中间判定质量）"
+  ]
+}
