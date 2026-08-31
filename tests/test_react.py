@@ -1,9 +1,9 @@
-"""Tests for the ReAct agent loop (B3 + B5).
+"""Tests for the ReAct agent loop (B3 + B5 + B4).
 
 FakeLLM 注入预设返回序列，不调真 LLM/不占 GPU。和 A 阶段检索器测试、
 B2 工具层测试同套路，秒级跑完。
 
-覆盖 7 个场景：
+覆盖 8 个场景：
 1. 单跳收敛（退出 A）：FakeLLM 第 1 跳直接 text 作答 → loop 1 步退出。
 2. 两跳收敛（退出 A）：第 1 跳 tool_call + 第 2 跳 text 作答 → 2 步退出，
    消息配对正确。
@@ -14,6 +14,8 @@ B2 工具层测试同套路，秒级跑完。
    用结构化 answer 退出，不再多跑一跳。
 7. judge insufficient：LLM 调 judge sufficient=false → 不退出，ack 喂回，
    下一跳继续（验证 LLM 仍是控制器，sufficient=false 不截停）。
+8. B4 证据池：retrieve 后证据入池 + 摘要注入 tool 结果（方案 B），judge
+   ack 不注入，无 retrieve 时池空。
 """
 
 from __future__ import annotations
@@ -349,6 +351,82 @@ def test_judge_then_retrieve_then_judge_exit(tools: RetrievalTools) -> None:
     assert result.stopped_reason == "answered"
     # 调了两次检索器。
     assert len(tools._retriever.calls) == 2  # type: ignore[attr-defined]
+
+
+# --- 场景 8：B4 证据池入池 + 摘要注入 ---
+
+def test_evidence_pool_accumulates_across_hops(tools: RetrievalTools) -> None:
+    """多跳 retrieve → 证据池累积去重后的证据（B4 入池）。
+
+    FakeRetriever 每次返回 d1/d2。两次 retrieve（之间夹一个 judge
+    insufficient）→ d1/d2 各被两跳命中 → hit_count=2，但池里只 2 条
+    （去重）。验证 pool.size 反映去重后不同文档数、hit_count 反映多跳命中。
+    """
+    judge_not_enough = LLMResponse(
+        tool_call=ToolCall(
+            id="j_ne", name="judge_evidence",
+            arguments={"sufficient": False, "next_query": "second hop",
+                       "reason": "need more"},
+        )
+    )
+    judge_enough = LLMResponse(
+        tool_call=ToolCall(
+            id="j_e", name="judge_evidence",
+            arguments={"sufficient": True, "answer": "done",
+                       "reason": "enough"},
+        )
+    )
+    # retrieve → judge(不足) → retrieve → judge(足) → 退出
+    fake = FakeLLM([_tool_call(), judge_not_enough, _tool_call(), judge_enough])
+    result = run_agent("q", llm_client=fake, tools=tools)
+
+    # 两次 retrieve 都返回 [d1, d2]，去重后池里 2 条，但各被两跳命中。
+    assert result.evidence_pool.size == 2
+    for ev in result.evidence_pool.items:
+        assert ev.hit_count == 2
+
+
+def test_evidence_summary_injected_into_retrieve_result(
+    tools: RetrievalTools,
+) -> None:
+    """retrieve 的 tool 结果消息含 [Evidence Pool] 摘要（B4 方案 B 注入）。
+
+    第 2 跳 LLM 能看到第 1 跳 retrieve 结果里注入的累积证据摘要。
+    """
+    fake = FakeLLM([_tool_call(), _answer()])
+    run_agent("q", llm_client=fake, tools=tools)
+
+    # 第 2 次 chat 调用时，第 1 跳的 tool 消息应含注入的证据池摘要。
+    second_call_msgs = fake.calls_messages[1]
+    tool_content = second_call_msgs[3]["content"]
+    assert "[Evidence Pool" in tool_content  # 摘要标记
+    assert "items" in tool_content           # 摘要计数
+    assert "Title d1" in tool_content        # 累积的文档标题
+
+
+def test_evidence_pool_empty_when_no_retrieve(tools: RetrievalTools) -> None:
+    """LLM 直接作答不调 retrieve → 证据池空（B4 边界）。"""
+    fake = FakeLLM([_answer("direct answer")])
+    result = run_agent("q", llm_client=fake, tools=tools)
+    assert result.evidence_pool.size == 0
+
+
+def test_judge_result_not_injected_with_pool(tools: RetrievalTools) -> None:
+    """judge 的 ack 不注入证据池摘要（B4 设计：只在 retrieve 后注入）。
+
+    judge 和 sufficient 退出在同一 tool_call，注入来不及影响这次判定。
+    """
+    judge_call = LLMResponse(
+        tool_call=ToolCall(
+            id="j1", name="judge_evidence",
+            arguments={"sufficient": True, "answer": "yes", "reason": "ok"},
+        )
+    )
+    fake = FakeLLM([judge_call])
+    result = run_agent("q", llm_client=fake, tools=tools)
+
+    # judge 没调 retrieve，证据池空，且 judge 的 ack 不含 Evidence Pool 标记。
+    assert result.evidence_pool.size == 0
 
 
 # --- 边界 ---

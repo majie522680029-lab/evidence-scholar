@@ -1,4 +1,4 @@
-"""ReAct agent loop (B3 + B5): Reason + Act over retrieval tools + evidence judge.
+"""ReAct agent loop (B3 + B5 + B4): Reason + Act over retrieval tools + evidence judge + evidence pool.
 
 B3 是 v2 agent 的"大脑"——手写 ReAct 循环。为什么手写而非直接上
 LangGraph：实习要求 #3 明确要"自己实现 ReAct Agent"。手写一遍才真懂
@@ -11,14 +11,25 @@ B5 给循环加了 Evidence Judge + Query Rewrite 的退出语义：LLM 不再�
 通道产出（B5 方案 3），绕开 Qwen3 thinking 混进 content 破坏 JSON 的
 稳定性问题——hermes parser 在 decode 期就约束了 tool_call 参数。
 
+B4 给循环加了证据累积池（EvidencePool）：替 agent 把每跳 retrieve
+命中的证据去重累积、整理成摘要，注入到 retrieve 的 tool 结果消息里
+（方案 B：系统自动注入，非 LLM 自己填）。LLM 下一跳看到的就不只是
+"这次检索返回了啥"，还有"到目前为止累积的所有证据"的紧凑视图——
+多跳金证据不丢、judge 组织答案有据可依、倾向简洁作答（对准 B6 暴露
+的答案啰嗦问题）。命中实习要求 #4 Long Context / Memory Management。
+
 ReAct 循环（每跳 Reason + Act）：
     messages = [system + user]
+    pool = EvidencePool()
     while step < max_steps:
         response = llm.chat(messages, tools)          # LLM 想一下
         if response 无 tool_call:                     # 退出 A（B3 兜底）
             return response.text
         tool_call = response.tool_call
         result = tools.execute(tool_call)              # 执行 LLM 指派的动作
+        if tool_call 是 retrieve:
+            pool.add(result_docs, query, hop)           # B4：证据入池
+            result += pool.summarize()                  # 方案 B：摘要注入
         messages += [assistant(tool_call), tool(result)]  # 喂回 LLM 观察
         if tool_call 是 judge 且 sufficient=true:      # 退出 B（B5 主路径）
             return judge.answer
@@ -36,6 +47,10 @@ ReAct 循环（每跳 Reason + Act）：
 - judge sufficient=false 不退出：把 ack（含 next_query）塞回 LLM，
   让 LLM 下一跳自己拿 next_query 去 retrieve。保持 LLM 是控制器，
   这是 ReAct 的核心；不硬塞检索动作。
+- B4 证据池注入点：retrieve 执行后把 pool.summarize() 拼进 tool 结果
+  消息（方案 B）。judge 不注入——judge 和 sufficient 退出在同一个
+  tool_call 里，注入也来不及影响这次判定；judge 靠上一跳 retrieve
+  已注入的摘要作决策。故注入只在 retrieve 后，时机正确。
 - 每跳记 trace（tool 名/参数/结果），是 B7 Langfuse 的本地雏形。
 - tool_call 出错（未知工具/参数非法）不崩循环——把错误塞回 LLM 让它
   自己修正，这是 agent 鲁棒性的关键（LLM 会给错参数，不能一崩了之）。
@@ -49,6 +64,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from evidence_scholar.agent.evidence_pool import EvidencePool
 from evidence_scholar.agent.tools import RetrievalTools
 
 logger = logging.getLogger(__name__)
@@ -128,6 +144,9 @@ class AgentResult:
     stopped_reason: str  # "answered" | "max_steps" | "error"
     trace: list[StepTrace] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
+    # B4：累积证据池。B6 评测可读 pool.size 看证据利用情况，B7 trace 可
+    # 序列化。默认空池（max_steps 兜底路径也返回池，便于统一分析）。
+    evidence_pool: EvidencePool = field(default_factory=EvidencePool)
 
 
 @dataclass
@@ -232,6 +251,9 @@ def run_agent(
 
     trace: list[StepTrace] = []
     tool_schema = tools.schema
+    # B4：跨跳累积证据池。每跳 retrieve 后入池，summarize() 注入到
+    # retrieve 的 tool 结果消息（方案 B），judge 下一跳就能看到整理后证据。
+    evidence_pool = EvidencePool()
 
     while state.step < max_steps:
         response = llm_client.chat(state.messages, tools=tool_schema)
@@ -248,6 +270,7 @@ def run_agent(
                 stopped_reason="answered",
                 trace=trace,
                 messages=state.messages,
+                evidence_pool=evidence_pool,
             )
 
         # 分支 2：LLM 要调工具 → 执行 → 喂回结果 → 看是否 judge 退出。
@@ -262,6 +285,18 @@ def run_agent(
         executed_ok = True
         try:
             result = tools.execute(tool_call.name, tool_call.arguments)
+            # B4 方案 B 注入点：retrieve 执行后，把命中证据入池，再把证据池
+            # 摘要拼进 tool 结果消息。judge 不注入（judge 与 sufficient 退出在
+            # 同一 tool_call，注入来不及影响这次判定；judge 靠上一跳 retrieve
+            # 已注入的摘要决策，时机正确）。
+            if tool_call.name == tools.HYBRID_TOOL_NAME:
+                # last_retrieval 是 (query, raw_results)，_execute_hybrid 设的。
+                last_query, last_results = tools.last_retrieval
+                evidence_pool.add(
+                    last_results, query=last_query, hop=state.step
+                )
+                # 摘要拼在 retrieve 结果后，LLM 下一跳（含 judge）能一并看到。
+                result = result + "\n\n" + evidence_pool.summarize()
             step_record.tool_result = result
             state.append_tool_result(tool_call.id, result)
         except (ValueError, KeyError) as error:
@@ -295,6 +330,7 @@ def run_agent(
                     stopped_reason="answered",
                     trace=trace,
                     messages=state.messages,
+                    evidence_pool=evidence_pool,
                 )
 
         trace.append(step_record)
@@ -307,6 +343,7 @@ def run_agent(
         stopped_reason="max_steps",
         trace=trace,
         messages=state.messages,
+        evidence_pool=evidence_pool,
     )
 
 
@@ -315,10 +352,14 @@ _DEFAULT_SYSTEM_PROMPT = (
     "question, call the retrieve_hybrid tool to search a document corpus; "
     "reformulate the question into focused retrieval queries and gather "
     "evidence across multiple rounds if the question is multi-hop. After "
-    "gathering evidence, call the judge_evidence tool to decide whether the "
-    "evidence is sufficient: set sufficient=true and write the final answer "
-    "in the answer field when ready, or set sufficient=false with a sharper "
-    "next_query to retrieve more. You are done once judge_evidence returns "
-    "sufficient=true. If a tool call fails, read the error and adjust your "
-    "next call. Keep answers grounded in retrieved evidence."
+    "each retrieval, the tool result includes an [Evidence Pool] summary of "
+    "all evidence gathered so far across hops—use it to track what you "
+    "know and avoid losing earlier evidence. When ready, call the "
+    "judge_evidence tool to decide whether the evidence is sufficient: set "
+    "sufficient=true and write the final answer in the answer field (keep "
+    "the answer concise—the answer itself, not a full sentence), or set "
+    "sufficient=false with a sharper next_query to retrieve more. You are "
+    "done once judge_evidence returns sufficient=true. If a tool call fails, "
+    "read the error and adjust your next call. Keep answers grounded in "
+    "retrieved evidence."
 )

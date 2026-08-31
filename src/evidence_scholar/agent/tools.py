@@ -241,6 +241,10 @@ class RetrievalTools:
         results: Sequence[RetrievalResult] = self._retriever.search(
             query, top_k=top_k
         )
+        # 缓存最近一次 retrieve 的原始结果 + query，供 B4 证据池入池用
+        # （react loop 在 execute 后读 last_retrieval 取原始 RetrievalResult，
+        # 避免反序列化或二次检索）。命名约定为 last_retrieval 公开属性。
+        self.last_retrieval: tuple[str, list[RetrievalResult]] = (query, list(results))
 
         # 序列化成 LLM 可读结构。空结果也要明确告知，避免 LLM 误以为
         # "没返回"等于"语料里确实没有"。
