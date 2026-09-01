@@ -1,4 +1,4 @@
-"""ReAct agent loop (B3 + B5 + B4): Reason + Act over retrieval tools + evidence judge + evidence pool.
+"""ReAct agent loop (B3 + B5 + B4 + B7): Reason + Act over retrieval tools + evidence judge + evidence pool + Langfuse tracing.
 
 B3 是 v2 agent 的"大脑"——手写 ReAct 循环。为什么手写而非直接上
 LangGraph：实习要求 #3 明确要"自己实现 ReAct Agent"。手写一遍才真懂
@@ -66,6 +66,7 @@ from typing import Any, Protocol
 
 from evidence_scholar.agent.evidence_pool import EvidencePool
 from evidence_scholar.agent.tools import RetrievalTools
+from evidence_scholar.agent.trace import TraceContext
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +219,7 @@ def run_agent(
     tools: RetrievalTools,
     max_steps: int = DEFAULT_MAX_STEPS,
     system_prompt: str | None = None,
+    trace_context: TraceContext | None = None,
 ) -> AgentResult:
     """Run the ReAct loop until the LLM answers or max_steps is hit.
 
@@ -232,6 +234,9 @@ def run_agent(
             + judge 两工具）。
         max_steps: 最大跳数兜底，防 LLM 无限调工具。
         system_prompt: 自定义 system 提示。默认用 ReAct agent 通用提示。
+        trace_context: B7 Langfuse trace 上下文。None 时自动建（配了 key
+            才真连云端，否则 no-op）。trace 挂了不崩主流程（TraceContext
+            自降级 no-op）。
 
     Returns:
         AgentResult：含最终答案（或 None 若超限）、跳数、trace、完整 messages。
@@ -241,6 +246,10 @@ def run_agent(
 
     if system_prompt is None:
         system_prompt = _DEFAULT_SYSTEM_PROMPT
+
+    # B7：开 trace 根 span（配了 Langfuse key 才真连云端，否则 no-op）。
+    if trace_context is None:
+        trace_context = TraceContext.start(question)
 
     state = AgentState(
         messages=[
@@ -255,8 +264,33 @@ def run_agent(
     # retrieve 的 tool 结果消息（方案 B），judge 下一跳就能看到整理后证据。
     evidence_pool = EvidencePool()
 
+    def _finish(
+        *, answer: str | None, stopped_reason: str, steps: int
+    ) -> AgentResult:
+        """统一收尾：记 trace 最终输出 + flush，返回 AgentResult。"""
+        trace_context.finish(
+            answer=answer, stopped_reason=stopped_reason,
+            steps=steps, evidence_pool_size=evidence_pool.size,
+        )
+        return AgentResult(
+            answer=answer,
+            steps=steps,
+            stopped_reason=stopped_reason,
+            trace=trace,
+            messages=state.messages,
+            evidence_pool=evidence_pool,
+        )
+
     while state.step < max_steps:
         response = llm_client.chat(state.messages, tools=tool_schema)
+        # B7：记 LLM 调用 span（含 token usage 算成本）。usage 可能 None
+        # （FakeLLM 或客户端没暴露）——TraceContext 自己容错。
+        trace_context.record_llm(
+            model=getattr(llm_client, "_model", "unknown"),
+            usage=getattr(response, "usage", None),
+            response_preview=response.text or
+                (str(response.tool_call) if response.tool_call else ""),
+        )
 
         # 退出 A（B3 原有，保留为兜底）：LLM 不再要工具 → 它在作答 → 成功退出。
         # B5 下这是次要路径——主路径走 judge；但 LLM 若忘调 judge 直接 text
@@ -264,18 +298,17 @@ def run_agent(
         if not response.wants_tool:
             answer = response.text or ""
             state.append_assistant_text(answer)
-            return AgentResult(
-                answer=answer,
+            return _finish(
+                answer=answer, stopped_reason="answered",
                 steps=state.step + 1,
-                stopped_reason="answered",
-                trace=trace,
-                messages=state.messages,
-                evidence_pool=evidence_pool,
             )
 
         # 分支 2：LLM 要调工具 → 执行 → 喂回结果 → 看是否 judge 退出。
         tool_call = response.tool_call
         assert tool_call is not None  # wants_tool 已保证
+
+        # B7：开 step span（每跳一个，挂根 trace 下）。
+        trace_context.start_step(state.step, tool_call)
 
         step_record = StepTrace(step=state.step, tool_call=tool_call)
         # 先把 assistant 的 tool_call 塞回历史（即使执行可能出错，消息配对
@@ -299,6 +332,8 @@ def run_agent(
                 result = result + "\n\n" + evidence_pool.summarize()
             step_record.tool_result = result
             state.append_tool_result(tool_call.id, result)
+            # B7：记工具结果 span。
+            trace_context.record_tool_result(result)
         except (ValueError, KeyError) as error:
             # tool 执行失败（未知工具名/参数非法等）：不崩循环，把错误
             # 描述塞回 LLM，让它自己看到错误并修正下一跳。是 agent 鲁棒
@@ -311,6 +346,11 @@ def run_agent(
                 state.step, tool_call.name, error,
             )
             state.append_tool_result(tool_call.id, err_msg)
+            # B7：记工具错误 span（错误也记进 trace，便于失败分析）。
+            trace_context.record_tool_result(err_msg, error=err_msg)
+
+        # B7：结束当前 step span。
+        trace_context.end_step()
 
         # 退出 B（B5 新增）：judge 判定 sufficient → 用结构化 answer 退出。
         # 只在执行成功时判（执行失败已塞回 LLM 自修正，不在此退出）。
@@ -324,26 +364,17 @@ def run_agent(
                 answer = judge["answer"] or response.text or ""
                 trace.append(step_record)
                 state.step += 1
-                return AgentResult(
-                    answer=answer,
+                return _finish(
+                    answer=answer, stopped_reason="answered",
                     steps=state.step,
-                    stopped_reason="answered",
-                    trace=trace,
-                    messages=state.messages,
-                    evidence_pool=evidence_pool,
                 )
 
         trace.append(step_record)
         state.step += 1
 
     # 走到这里 = LLM 一直要工具、超过 max_steps 仍没作答 → 兜底截停。
-    return AgentResult(
-        answer=None,
-        steps=state.step,
-        stopped_reason="max_steps",
-        trace=trace,
-        messages=state.messages,
-        evidence_pool=evidence_pool,
+    return _finish(
+        answer=None, stopped_reason="max_steps", steps=state.step,
     )
 
 
