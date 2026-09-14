@@ -18,11 +18,13 @@ dependencies = [
     "openai>=1.0,<4.0",  # 调 vLLM 的 OpenAI 兼容 API（B1 起服务，B3 调用）
     # torch 由 sentence-transformers 间接拉取；如需 CUDA 版，
     # 须用: pip install torch --index-url https://download.pytorch.org/whl/cu121
+    "mcp>=2.1,<2.2",  # C1 MCP server（MCPServer，2.x 把 FastMCP 改名）
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0,<9.0",
+    "pytest-asyncio>=0.23,<0.25",  # C1 MCP 测试用 async（call_tool 是协程）
     "ruff>=0.8,<1.0",
 ]
 
@@ -32,6 +34,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+asyncio_mode = "auto"  # C1 MCP 测试 async，auto 模式自动识别 async def 测试
 
 [tool.ruff]
 line-length = 100
