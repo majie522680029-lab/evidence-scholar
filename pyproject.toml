@@ -19,6 +19,7 @@ dependencies = [
     # torch 由 sentence-transformers 间接拉取；如需 CUDA 版，
     # 须用: pip install torch --index-url https://download.pytorch.org/whl/cu121
     "mcp>=2.1,<2.2",  # C1 MCP server（MCPServer，2.x 把 FastMCP 改名）
+    "langgraph>=1.2,<1.3",  # C2 LangGraph 重写（StateGraph，1.2.x API）
 ]
 
 [project.optional-dependencies]

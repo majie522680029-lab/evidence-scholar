@@ -190,11 +190,35 @@ pytest -q     # all green; FakeLLM-injected, no GPU needed
 
 ---
 
+## Hand-written ReAct vs LangGraph rewrite (C2)
+
+The agent exists in two equivalent implementations, verified against the same FakeLLM test suite (9 scenarios, all passing on both):
+
+- `src/evidence_scholar/agent/react.py` — hand-written `while` loop (B3, requirement #3)
+- `src/evidence_scholar/agent/react_langgraph.py` — LangGraph `StateGraph` (C2, requirement #7)
+
+Both share the same `RetrievalTools`, `EvidencePool`, `LLMClient`, and `AgentResult` — only the loop skeleton differs.
+
+| Aspect | Hand-written | LangGraph |
+|---|---|---|
+| Loop control | `while step < max_steps` | Graph edges + `END` node |
+| State mgmt | manual `AgentState` append | `TypedDict` + `add_messages` reducer |
+| Termination | two `if` exits | conditional edges routing to `END` |
+| Max-steps backstop | counter in loop | `recursion_limit` on `invoke()` |
+| Checkpoint / resume | not supported | built-in via `checkpointer` |
+| Graph visualization | none | `compiled.get_graph().draw_*` |
+| Abstraction overhead | low, direct | higher, one extra indirection |
+
+The point of keeping both: the hand-written version is ground truth (logic direct, debuggable, no framework lock-in); the LangGraph version shows what the framework buys you (state reducers, checkpointing, visualization) and what it costs (abstraction, TypedDict constraints, string-routed edges that only fail at runtime).
+
+---
+
 ## Tech stack
 
 - **LLM serving**: vLLM 0.18 + Qwen3-8B-Instruct (local, OpenAI-compatible, hermes tool parser)
 - **Retrieval**: BM25 (rank-bm25), Dense (sentence-transformers + FAISS-gpu), RRF hybrid, cross-encoder reranker
-- **Agent**: hand-written ReAct loop (no LangChain/LangGraph yet)
+- **Agent**: hand-written ReAct loop + LangGraph rewrite (both, behavior-equivalent)
+- **MCP**: retrieval exposed as MCP server (stdio, C1)
 - **Eval**: HotpotQA distractor (answer-level EM/F1/yes-no subset)
 - **Tracing**: Langfuse 4.x (OTel API, cloud)
 - **Tests**: pytest, FakeLLM injection (GPU-free test suite)
@@ -207,7 +231,7 @@ pytest -q     # all green; FakeLLM-injected, no GPU needed
 |---|---|---|
 | A | Retrieval pipeline (BM25/Dense/Hybrid/Reranker + ablation) | done |
 | B | Agent (vLLM / tools / ReAct / judge / evidence pool / eval / tracing) | done |
-| C | Engineering: MCP server (done), LangGraph rewrite, guardrail, FastAPI + Redis + PG, long-term memory | in progress |
+| C | Engineering: MCP server (done), LangGraph rewrite (done), guardrail, FastAPI + Redis + PG, long-term memory | in progress |
 | D | Deployment: Docker, arxiv academic-review end product | planned |
 
 See project notes for phase C/D design.
