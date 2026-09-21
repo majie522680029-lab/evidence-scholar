@@ -1,10 +1,12 @@
 """Shared data schemas for datasets, retrieval and evaluation."""
-
 from pydantic import BaseModel, ConfigDict, Field
 
 
 class SupportingFact(BaseModel):
-    """A sentence-level gold evidence annotation."""
+    """
+    A sentence-level gold evidence annotation.
+    HotpotQA 官方提供的一条标准证据
+    """
 
     model_config = ConfigDict(frozen=True)
 

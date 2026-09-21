@@ -67,6 +67,7 @@ from typing import Any, Protocol
 from evidence_scholar.agent.evidence_pool import EvidencePool
 from evidence_scholar.agent.tools import RetrievalTools
 from evidence_scholar.agent.trace import TraceContext
+from evidence_scholar.agent.guardrails import check_input
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +247,23 @@ def run_agent(
 
     if system_prompt is None:
         system_prompt = _DEFAULT_SYSTEM_PROMPT
+
+    # C3 输入护栏：question 进 LLM 前过一道。block 则不建 state、不调
+    # LLM，直接以 blocked_by_guardrail 收尾（和 max_steps 兜底同形）。
+    _decision = check_input(question)
+    if _decision.is_blocked:
+        if trace_context is None:
+            trace_context = TraceContext.start(question)
+        return AgentResult(
+            answer=None,
+            steps=0,
+            stopped_reason="blocked_by_guardrail",
+            trace=[],
+            messages=[
+                {"role": "user", "content": question},
+            ],
+            evidence_pool=EvidencePool(),
+        )
 
     # B7：开 trace 根 span（配了 Langfuse key 才真连云端，否则 no-op）。
     if trace_context is None:

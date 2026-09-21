@@ -213,6 +213,16 @@ The point of keeping both: the hand-written version is ground truth (logic direc
 
 ---
 
+## Guardrails (C3, input layer)
+
+The agent runs an input guardrail before the ReAct loop: `check_input(question)` blocks questions that are empty, exceed the length limit (2000 chars), or match prompt-injection keyword patterns (instruction override, identity reset, system-prompt exfiltration, jailbreak tropes). On block, both `run_agent` and `run_agent_langgraph` return early with `stopped_reason="blocked_by_guardrail"`, `answer=None`, `steps=0` — never reaching the LLM.
+
+**Honest scope of the keyword layer.** Regex/keyword matching catches template attacks (copy-pasted jailbreak prompts) but is *not* a silver bullet — semantic rewrites, language switches, and zero-feature-word attacks bypass it. It is the cheapest outer sentry in a defense-in-depth stack, not the whole defense. The real protection is system design: the agent holds only read-only retrieval tools (`retrieve_hybrid` / `judge_evidence`) with no side effects, so even a successfully injected instruction cannot cause destructive actions. Semantic-layer defenses (LLM-as-judge on output) and indirect-injection detection (spotlighting retrieved documents) are optional future enhancements.
+
+Both agent versions share the guardrail hook, verified equivalent (same `stopped_reason` / `answer` / `steps` on blocked input).
+
+---
+
 ## Tech stack
 
 - **LLM serving**: vLLM 0.18 + Qwen3-8B-Instruct (local, OpenAI-compatible, hermes tool parser)
@@ -231,7 +241,7 @@ The point of keeping both: the hand-written version is ground truth (logic direc
 |---|---|---|
 | A | Retrieval pipeline (BM25/Dense/Hybrid/Reranker + ablation) | done |
 | B | Agent (vLLM / tools / ReAct / judge / evidence pool / eval / tracing) | done |
-| C | Engineering: MCP server (done), LangGraph rewrite (done), guardrail, FastAPI + Redis + PG, long-term memory | in progress |
+| C | Engineering: MCP server (done), LangGraph rewrite (done), guardrail input layer (done), FastAPI + Redis + PG, long-term memory | in progress |
 | D | Deployment: Docker, arxiv academic-review end product | planned |
 
 See project notes for phase C/D design.

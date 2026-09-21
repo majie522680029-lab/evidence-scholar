@@ -66,6 +66,7 @@ from evidence_scholar.agent.react import (
     _DEFAULT_SYSTEM_PROMPT,
 )
 from evidence_scholar.agent.tools import RetrievalTools
+from evidence_scholar.agent.guardrails import check_input
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,21 @@ def run_agent_langgraph(
         raise ValueError("max_steps must be greater than zero.")
     if system_prompt is None:
         system_prompt = _DEFAULT_SYSTEM_PROMPT
+
+    # C3 输入护栏：和 react.py 同位置同形，block 直接返回不建图、不调
+    # LLM。两版行为等价（test_react_langgraph 验证）。
+    _decision = check_input(question)
+    if _decision.is_blocked:
+        return AgentResult(
+            answer=None,
+            steps=0,
+            stopped_reason="blocked_by_guardrail",
+            trace=[],
+            messages=[
+                {"role": "user", "content": question},
+            ],
+            evidence_pool=EvidencePool(),
+        )
 
     tool_schema = tools.schema
 
