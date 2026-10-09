@@ -20,6 +20,10 @@ dependencies = [
     # 须用: pip install torch --index-url https://download.pytorch.org/whl/cu121
     "mcp>=2.1,<2.2",  # C1 MCP server（MCPServer，2.x 把 FastMCP 改名）
     "langgraph>=1.2,<1.3",  # C2 LangGraph 重写（StateGraph，1.2.x API）
+    "redis>=5.0,<9.0",  # C4 语义缓存（服务端 conda 装的 redis-server 5.0）
+    "psycopg2-binary>=2.9,<3.0",  # C4 PG 持久化（服务端 conda 装的 postgres 16）
+    "fastapi>=0.110,<0.120",  # C4 API 服务
+    "uvicorn[standard]>=0.29,<0.40",  # C4 ASGI server
 ]
 
 [project.optional-dependencies]
